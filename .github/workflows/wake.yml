@@ -1,0 +1,63 @@
+# Wake relay for the free-tier nse-api service. This folder is a template for a NEW public
+# repository (see ../../README.md); it is not run from this repository.
+#
+# Why it exists: Render's routing layer refuses cron-job.org's request to a sleeping service
+# (HTTP 429 and 503 "hibernate-wake-error", no instance started), while the same request from a
+# GitHub runner started it in 62 seconds (2026-10-03). GitHub's own `schedule` trigger is too late
+# too often to be the only path, but a dispatch is delivered within seconds (4 s measured). So
+# cron-job.org, which is punctual, only dispatches this workflow through the GitHub API and the
+# runner sends the wake request.
+#
+# The only thing a dispatch can do here is send the request below: no secrets, no inputs, no
+# schedule, no permissions on the repository. A run that finds the service up costs one tiny request.
+
+name: wake
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+# A second dispatch while one is running waits instead of sending a second wake at the same time.
+concurrency:
+  group: wake
+  cancel-in-progress: false
+
+jobs:
+  wake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      WAKE_URL: https://nse-api-n959.onrender.com/livez
+      WAKE_RETRY_SECONDS: "60"
+    steps:
+      - name: Wake nse-api (/livez)
+        run: |
+          set -euo pipefail
+          ua="news-signal-engine gh-relay-wake"
+          for attempt in 1 2 3 4; do
+            body=$(mktemp)
+            set +e
+            http=$(curl -fsS -m 150 -A "$ua" -o "$body" -w '%{http_code}' "$WAKE_URL")
+            curl_rc=$?
+            set -e
+            live=false
+            if [ "$curl_rc" -eq 0 ] && grep -qE '"status"[[:space:]]*:[[:space:]]*"live"' "$body"; then
+              live=true
+            fi
+            rm -f "$body"
+            if [ "$live" = true ]; then
+              echo "attempt ${attempt}: ok HTTP ${http}, status live"
+              exit 0
+            fi
+            if [ "$curl_rc" -ne 0 ] || [ "$http" -lt 200 ] || [ "$http" -ge 300 ]; then
+              echo "attempt ${attempt}: failed HTTP ${http:-000}"
+            else
+              echo "attempt ${attempt}: HTTP ${http} without live status"
+            fi
+            if [ "$attempt" -lt 4 ]; then
+              sleep "$WAKE_RETRY_SECONDS"
+            fi
+          done
+          echo "wake failed after 4 attempts" >&2
+          exit 1
