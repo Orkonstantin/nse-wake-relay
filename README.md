@@ -91,11 +91,14 @@ hours early (05:11, 06:11 and 07:11 UTC on weekdays) and the runner then waits f
   `already_up` (answered in under 10 s) or `cold_start` (took 10 s or more, so the request met a sleeping or booting
   service). A class is that request's own result; whether it caused the start is read from the service's own log.
 * A run fails (and GitHub e-mails the owner, if notifications are on) only when its last request got no live answer.
-* Cost: runner time is free for a public repository; up to three runners can sit waiting for up to about 3 hours on a
-  weekday. Render sees at most six tiny requests.
+* Cost: runner time is free for a public repository; up to three runners can sit waiting on a weekday, for up to about 3
+  hours in summer time and up to about 4 hours after the clock change in November (the earliest slot starts 05:11 UTC, the
+  rescue is at 08:00:30 or 09:00:30 UTC). Render normally sees two tiny requests per run (the wake and the rescue), six
+  for three runs; at most eighteen if every attempt of every run fails.
 * Rehearse it by hand (this starts the sleeping service, 15 instance minutes): in the Actions tab choose `wake-early`, Run
   workflow, and fill `wake_at` and `rescue_at` with UTC times a few minutes ahead (for example `2026-10-04T07:00:00Z` and
-  `2026-10-04T07:07:30Z`); `skip` leaves a stage out.
+  `2026-10-04T07:07:30Z`); `skip` leaves a stage out. Leaving both fields empty runs the production defaults (03:53:00 and
+  04:00:30 New York time of today), including the same checks a scheduled run makes; use that to rehearse the real thing.
 * GitHub disables scheduled workflows of a public repository after 60 days without repository activity. The first sign
   would be that no `wake-early` run appears on a weekday morning; pushing any commit re-enables them.
 
