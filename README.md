@@ -13,11 +13,13 @@ cron-job.org (03:50 America/New_York, weekdays)
     -> GitHub runner: GET https://nse-api-n959.onrender.com/livez    (cold start, about 60-70 s, 4 attempts)
 ```
 
-This repository holds two workflows. `.github/workflows/wake.yml` is copied byte for byte from the project's reviewed
+This repository holds three workflows. `.github/workflows/wake.yml` is copied byte for byte from the project's reviewed
 `ops/wake-relay` template (its header comment still calls it a template; here it is the real thing); it is the precise
 path and needs the token below. `.github/workflows/wake-early.yml` is a backup that needs no token at all (see "Backup
-that needs no token" further down). There are no secrets here and none are needed. A token limited to this repository can
-neither read nor change anything else; it can only trigger Actions in this repository.
+that needs no token" further down). `.github/workflows/activity-evidence.yml` wakes nothing: it records what the service's
+public health page shows during the trading day (see "Evidence without a computer awake" further down). There are no
+secrets here and none are needed. A token limited to this repository can neither read nor change anything else; it can only
+trigger Actions in this repository.
 
 ## One-time setup (the repository and the workflow already exist)
 
@@ -101,6 +103,86 @@ hours early (05:11, 06:11 and 07:11 UTC on weekdays) and the runner then waits f
   04:00:30 New York time of today), including the same checks a scheduled run makes; use that to rehearse the real thing.
 * GitHub disables scheduled workflows of a public repository after 60 days without repository activity. The first sign
   would be that no `wake-early` run appears on a weekday morning; pushing any commit re-enables them.
+
+## Evidence without a computer awake: `activity-evidence`
+
+`.github/workflows/activity-evidence.yml` wakes nothing. It reads the **public** health page of the service
+(`https://nse-api-n959.onrender.com/health`) at fixed New York times and judges what it shows, so that the evidence of a
+trading day exists even when no computer is awake. It needs no token, no secret and no repository permission, and it does
+not use the operator fields (those need the internal key).
+
+**A running server is not a ready worker, so three levels are judged separately:**
+
+| Level | Question | Evidence on the page | Checks |
+|---|---|---|---|
+| Server live | Does the web process answer? | HTTP 200 from `/health` in under 30 s, and `supervisor.last_started_at`, when the supervisor of the window loop started: the start of the web process while `supervisor.restarts` is 0, so the page itself shows that the server was up before 08:00:00Z, without the Render log. A slower answer from a supervisor that started after the request was sent means the request woke the service: FAIL inside the window, allowed (`N/A`) while no window is open. A slow answer from one that started earlier was a stall: FAIL. The same start is `Application startup complete` in the service log, which this workflow does not read | `server_live` |
+| Worker started | Did the duty cycle start the worker when the session window opened? | `duty_cycle.phase`, `windows_run`, `last_started_at`: set when the window loop calls the worker, before the worker has finished booting | `window_open`, `worker_started` |
+| Worker ready | Has the worker finished booting, is its heartbeat fresh, and does the service judge itself healthy? | `worker.ok` and `booted_at`, `readiness.status` and `startup_grace`, job freshness, `catch_up`, `supervisor`, failed Telegram sends | `worker_heartbeat`, `readiness_status`, `startup_grace_over`, `jobs_fresh`, `catch_up_done`, `supervisor_stable`, `telegram_delivery` |
+
+`supervisor.running` is true from the start of the process (it supervises the window loop, not the worker), so it is never
+used as a sign of a running worker.
+
+**Result words.** `PASS`: measured on time and the criterion holds. `FAIL`: measured and it does not hold. `DEGRADED`:
+measured and partly wrong (the service says DEGRADED, stale jobs, a restart, failed sends). `MISSING`: not measured, or not
+measured at the checkpoint: no answer, a field absent, still inside the 600 s startup grace (stale jobs are hidden then), a
+probe that arrived more than two minutes late, a run that never started, and **a weekday on which the service says there is
+no session window** (a market holiday would explain it, but the service decides that from its own exchange calendar, which
+is the thing being checked, and this workflow has no calendar of its own). `N/A`: does not apply (a weekend has no session
+window; no wake-up gap to catch up on; a sleeping service woken while no window is open). **MISSING is never a pass.** A
+run is green only if every checkpoint is `PASS` or `N/A`. A red run makes GitHub e-mail the owner (if notifications are
+on), so it means "look at it", not "it is broken".
+
+**Checkpoints** (New York time, computed on the runner, so the clock change needs no edit; the cron entries are UTC and
+early enough for both offsets, and every slot exists twice because GitHub delays and drops scheduled runs):
+
+| Id | Time | Judged as | Cron slots (UTC) |
+|---|---|---|---|
+| C1 | 04:05:00 | early: server, worker started, heartbeat, readiness, restarts. Jobs and catch-up are `N/A` (the first minutes are inside the grace) | 06:30 and 07:30 |
+| C2 | 04:30:00 | steady: all checks, including job freshness after the grace and the wake-up catch-up. Not earlier: the interval jobs make their first poll one interval after the start, and a job that has not polled yet counts as stale once the 600 s grace is over (on 2026-10-02 readiness showed `stale jobs: gdelt` at 08:15:04Z and was HEALTHY at 08:20:07Z, 08:25:12Z and 08:30:14Z) | same runs as C1 |
+| C3 | 13:00:00 | steady (regular session; the IEX stream is part of the service's own readiness) | 15:30 and 16:30 |
+| C4 | 19:50:00 | steady, ten minutes before the window closes | 20:30 and 22:30 |
+| C5 | 20:02:00 | closing: window closed, worker stopped on schedule, readiness `IDLE`, no restart all day | same runs as C4 |
+
+A run that starts after a checkpoint reads at once, but only while the service is expected to be awake, because any request
+wakes a sleeping service: until 20:00 New York time for C1 to C4 (the regular end of the window; for C4 that is ten minutes)
+and for eight minutes after C5. Later than that the checkpoint is `MISSING` and nothing is sent. What the service keeps
+(first start, restarts, the catch-up result, the stop) is still judged from a late read; everything about "now" becomes
+`MISSING`. A slot that GitHub never starts leaves no run at all: count a checkpoint without any run as `MISSING`.
+
+**Holidays and early closes.** On a weekday without a window (a market holiday, or an early-close day at 19:50, when the
+window ended at 17:00) `window_open` is `MISSING` and the later checkpoint of the same run sends nothing more. The first
+read of a group that finds the service asleep wakes it (about 15 instance minutes; reported as `N/A` for `server_live`).
+Expect a red `MISSING` run on such days; it is the honest answer, and it is also the answer if the service's calendar were
+wrong on a real trading day. On an early-close day C5 therefore cannot show the stop. If the duty cycle is switched off in
+the service (`duty_cycle.enabled` false) `window_open` is a `FAIL`, because the free-tier hours budget assumes the window.
+
+**Reading it.** Every checkpoint logs a `CHECKPOINT` line, one `CHECK` line per check and one `EVIDENCE` line (JSON with the
+reduced snapshot: no error texts, no job payloads), and the run summary has a table:
+
+```
+gh run list -R Orkonstantin/nse-wake-relay --workflow activity-evidence.yml --created 2026-10-05 --json databaseId,event,createdAt,conclusion
+gh run view RUN_ID -R Orkonstantin/nse-wake-relay --log | grep -E 'CHECKPOINT|CHECK |EVIDENCE'
+```
+
+GitHub keeps run logs for 90 days by default. The repository is public, so the logs are public: they hold only what the
+public health page already shows.
+
+**What it cannot see.** The bandwidth tripwire's day total and the kernel transmit counters are operator fields
+(`X-Internal-Api-Key`) and are not read here. Render's hourly bandwidth series, memory series and service log are Render's
+and are read there. A checkpoint shows one minute plus what the service retains; it is not a continuous watch.
+
+**Cost.** One read per checkpoint, up to ten a day while both slots of a group run. The size of each answer is logged
+(`bytes`). On the service a read is a database read and one low-priority Alpaca snapshot request (that is how `/health`
+works). C5 runs two minutes after the close, so that evening's idle shutdown follows C5 by about 15 minutes instead of the
+close. On a weekday without a window, the first read of group B and of group C each wake the sleeping service (see above).
+
+**Rehearse or re-run by hand** (this starts the service if it sleeps): Actions -> `activity-evidence` -> Run workflow.
+`group` takes `A`, `B` or `C` and runs that group's real checkpoints of today. `times` takes UTC times
+(`C1=2026-10-05T08:05:00Z,C2=2026-10-05T08:30:00Z`); C1 is judged as the early checkpoint, C5 as the closing one, any other
+name as a steady one. Outside the window a rehearsal on a weekend shows `window_open N/A` and a green run, and on a weekday
+`MISSING` and a red one: it exercises the mechanics, not the PASS path.
+
+**Switch it off:** disable the workflow in the Actions tab, or delete the file.
 
 ## Operating notes
 
