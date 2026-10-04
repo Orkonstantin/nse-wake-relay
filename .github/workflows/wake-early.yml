@@ -1,0 +1,200 @@
+# Tokenless backup for the cron-job.org dispatch relay (wake.yml): the runner wakes the sleeping
+# free-tier nse-api service by itself, at an exact New York time, with no computer of the owner awake.
+#
+# GitHub's `schedule` trigger is not punctual (this project's own history, 20 mornings: the first run
+# at or after 07:50 UTC came 46 minutes late at the median, 92 at the 90th percentile and 222 at
+# worst; about one hourly slot in three was never delivered). So this workflow does not ask to be
+# punctual. It is scheduled hours EARLY and the runner then waits for the exact time, so a slot that
+# starts late still acts on time as long as it starts before the wake time. A slot that starts after
+# the wake time acts at once, and one that starts after 11:00 New York time does nothing.
+#
+# Times are New York times, so the clock change needs no edit: wake 03:53:00, rescue 04:00:30 (the
+# project's market window opens at 04:00). The cron entries below are UTC and early enough for both
+# offsets (03:53 New York is 07:53 UTC in summer and 08:53 UTC in winter).
+#
+# What a run can do: send GET https://nse-api-n959.onrender.com/livez (the wake: up to 4 attempts, 60 s
+# apart) and, at the rescue time, one more request of the same kind (up to 2 attempts, 30 s apart). A
+# request to a service that is already up costs one tiny response. Several slots can be waiting at the
+# same moment; their requests are identical and idempotent. No secrets, no repository write
+# permission; the two test inputs are read as times by `date` and are never run as shell code.
+
+name: wake-early
+
+on:
+  schedule:
+    - cron: "11 5 * * 1-5"
+    - cron: "11 6 * * 1-5"
+    - cron: "11 7 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      wake_at:
+        description: "Test only. Wake time in UTC (for example 2026-10-04T07:00:00Z), or skip. Empty means 03:53 New York time today."
+        required: false
+        default: ""
+        type: string
+      rescue_at:
+        description: "Test only. Rescue time in UTC (for example 2026-10-04T07:07:30Z), or skip. Empty means 04:00:30 New York time today."
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  actions: read
+
+jobs:
+  wake-early:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    env:
+      WAKE_URL: https://nse-api-n959.onrender.com/livez
+      SCHEDULE: ${{ github.event.schedule }}
+      WAKE_AT_INPUT: ${{ github.event.inputs.wake_at }}
+      RESCUE_AT_INPUT: ${{ github.event.inputs.rescue_at }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Wait for the wake time, wake, wait for the rescue time, rescue
+        run: |
+          set -uo pipefail
+
+          ua="news-signal-engine gh-early-wake"
+          last_probe_ok=none
+
+          stamp() { date -u +%Y-%m-%dT%H:%M:%S.%3NZ; }
+          say() { printf '%s %s\n' "$(stamp)" "$*"; }
+          iso() { if [ "$1" = skip ]; then printf 'skip'; else date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ; fi; }
+
+          # An input is a UTC time, "skip", or empty (then the default epoch is used).
+          resolve() {
+            case "$1" in
+              "") printf '%s' "$2" ;;
+              skip) printf 'skip' ;;
+              *) date -u -d "$1" +%s ;;
+            esac
+          }
+
+          wait_until() {
+            local target="$1" left
+            while :; do
+              left=$((target - $(date -u +%s)))
+              if [ "$left" -le 0 ]; then return 0; fi
+              if [ "$left" -gt 90 ]; then sleep 30; else sleep 1; fi
+            done
+          }
+
+          # probe LABEL ATTEMPTS PAUSE: sets LAST_CLASS (already_up, cold_start or failed), LAST_SENT, LAST_SECS.
+          probe() {
+            local label="$1" attempts="$2" pause="$3" attempt http rc body sent t0 t1 secs live
+            LAST_CLASS=failed
+            for attempt in $(seq 1 "$attempts"); do
+              body=$(mktemp)
+              sent=$(stamp)
+              t0=$(date +%s.%N)
+              http=$(curl -sS -m 150 -A "$ua" -o "$body" -w '%{http_code}' "$WAKE_URL")
+              rc=$?
+              t1=$(date +%s.%N)
+              secs=$(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.1f", b - a }')
+              live=false
+              if [ "$rc" -eq 0 ] && [ "$http" = "200" ] && grep -qE '"status"[[:space:]]*:[[:space:]]*"live"' "$body"; then
+                live=true
+              fi
+              rm -f "$body"
+              LAST_CLASS=failed
+              if [ "$live" = true ]; then
+                if awk -v s="$secs" 'BEGIN { exit !(s < 10) }'; then LAST_CLASS=already_up; else LAST_CLASS=cold_start; fi
+              fi
+              say "RESULT label=${label} attempt=${attempt} sent=${sent} http=${http:-000} curl_rc=${rc} seconds=${secs} live=${live} class=${LAST_CLASS}"
+              if [ "$live" = true ]; then
+                LAST_SENT="$sent"
+                LAST_SECS="$secs"
+                return 0
+              fi
+              if [ "$attempt" -lt "$attempts" ]; then sleep "$pause"; fi
+            done
+            return 1
+          }
+
+          run_info=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" --jq '[.created_at, .run_started_at] | @tsv' 2>/dev/null || true)
+
+          slot=""
+          if [ -n "$SCHEDULE" ]; then
+            slot_min=$(printf '%s' "$SCHEDULE" | awk '{ print $1 }')
+            slot_hour=$(printf '%s' "$SCHEDULE" | awk '{ print $2 }')
+            slot=$(date -u -d "$(date -u +%F) ${slot_hour}:${slot_min}:00" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)
+          fi
+
+          et_date=$(TZ=America/New_York date +%F)
+          default_wake=$(TZ=America/New_York date -d "${et_date} 03:53:00" +%s)
+          default_rescue=$(TZ=America/New_York date -d "${et_date} 04:00:30" +%s)
+          test_mode=false
+          if [ -n "${WAKE_AT_INPUT}${RESCUE_AT_INPUT}" ]; then test_mode=true; fi
+          wake_at=$(resolve "$WAKE_AT_INPUT" "$default_wake") || { say "ERROR wake_at is not a time"; exit 2; }
+          rescue_at=$(resolve "$RESCUE_AT_INPUT" "$default_rescue") || { say "ERROR rescue_at is not a time"; exit 2; }
+
+          say "PLAN event=${GITHUB_EVENT_NAME} test=${test_mode} schedule='${SCHEDULE}' slot=${slot:-none} created_and_started='${run_info:-unknown}' wake_at=$(iso "$wake_at") rescue_at=$(iso "$rescue_at")"
+
+          now=$(date -u +%s)
+          if [ "$test_mode" = false ]; then
+            if [ "$now" -ge "$wake_at" ] && [ "$((10#$(TZ=America/New_York date +%H%M)))" -ge 1100 ]; then
+              say "SKIP started after 11:00 New York time; nothing sent"
+              exit 0
+            fi
+            if [ "$((wake_at - now))" -gt 18000 ]; then
+              say "SKIP more than 5 hours before the wake time (job time limit); nothing sent"
+              exit 0
+            fi
+          fi
+
+          wake_result=skipped
+          if [ "$wake_at" != skip ]; then
+            if [ "$wake_at" -gt "$(date -u +%s)" ]; then
+              say "WAIT until the wake time $(iso "$wake_at")"
+              wait_until "$wake_at"
+            else
+              say "LATE the wake time $(iso "$wake_at") passed $(( $(date -u +%s) - wake_at )) s ago; sending now"
+            fi
+            if probe wake 4 60; then
+              last_probe_ok=true
+              wake_result="${LAST_CLASS} sent=${LAST_SENT} seconds=${LAST_SECS}"
+            else
+              last_probe_ok=false
+              wake_result=failed
+            fi
+          fi
+
+          rescue_result=skipped
+          if [ "$rescue_at" != skip ]; then
+            if [ "$rescue_at" -gt "$(date -u +%s)" ]; then
+              say "WAIT until the rescue time $(iso "$rescue_at")"
+              wait_until "$rescue_at"
+              if probe rescue 2 30; then
+                last_probe_ok=true
+                rescue_result="${LAST_CLASS} sent=${LAST_SENT} seconds=${LAST_SECS}"
+              else
+                last_probe_ok=false
+                rescue_result=failed
+              fi
+            else
+              say "NO RESCUE the rescue time $(iso "$rescue_at") has passed; the wake request above is the only one"
+              rescue_result="not needed (the wake request ran after the rescue time)"
+            fi
+          fi
+
+          {
+            echo "### wake-early"
+            echo ""
+            echo "| item | value |"
+            echo "|---|---|"
+            echo "| event | ${GITHUB_EVENT_NAME} |"
+            echo "| schedule slot | ${slot:-none} |"
+            echo "| created and started | ${run_info:-unknown} |"
+            echo "| wake time | $(iso "$wake_at") |"
+            echo "| wake result | ${wake_result} |"
+            echo "| rescue time | $(iso "$rescue_at") |"
+            echo "| rescue result | ${rescue_result} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$last_probe_ok" = false ]; then
+            say "FAILED the last request did not get a live answer"
+            exit 1
+          fi
+          say "DONE wake=${wake_result}; rescue=${rescue_result}"
