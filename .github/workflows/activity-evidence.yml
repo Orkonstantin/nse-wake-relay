@@ -1,0 +1,644 @@
+name: activity-evidence
+
+# Reads the PUBLIC health page of nse-api at fixed New York times and judges what it shows, so that the evidence of
+# a trading day exists without any computer awake. It needs no token, no secret and no repository permission, and it
+# reads only the public /health page (the operator fields stay behind the internal key and are not used here).
+#
+# Three levels are kept apart on purpose:
+#   server live     the web process answers (server_live)
+#   worker started  the window loop began the worker at the opening of the window (window_open, worker_started)
+#   worker ready    the worker finished booting, keeps its heartbeat and the service judges itself healthy
+#                   (worker_heartbeat, readiness_status, startup_grace_over, jobs_fresh, catch_up_done, ...)
+# Every check ends as PASS, FAIL, DEGRADED, MISSING or N/A. MISSING (no answer, a field absent, a probe that came late,
+# a checkpoint whose run never started) is never counted as a pass. A run is green only if every checkpoint is PASS or
+# N/A, so a red run (and GitHub's failure e-mail) means "look at it", not "it is broken".
+#
+# Each run waits, hours if need be, for the exact New York time of its checkpoints (computed on the runner, so the
+# clock change needs no edit) and logs one CHECKPOINT line, one CHECK line per check and one EVIDENCE line (JSON) per
+# checkpoint. Slots come in pairs because GitHub delays and drops scheduled runs.
+on:
+  schedule:
+    - cron: "30 6 * * 1-5"   # group A: 04:05 and 04:30 New York (worker started, worker ready)
+    - cron: "30 7 * * 1-5"
+    - cron: "30 15 * * 1-5"  # group B: 13:00 New York (regular session)
+    - cron: "30 16 * * 1-5"
+    - cron: "30 20 * * 1-5"  # group C: 19:50 and 20:02 New York (end of the window, worker stopped)
+    - cron: "30 22 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      group:
+        description: "Production checkpoints of one group: A (04:05 and 04:30 New York time), B (13:00) or C (19:50 and 20:02). Leave empty when times is used."
+        required: false
+        default: ""
+      times:
+        description: "Rehearsal: comma-separated UTC times, optionally named, for example C1=2026-10-05T08:05:00Z,C2=2026-10-05T08:30:00Z. C1 is judged as the early checkpoint and C5 as the closing one; any other name as a steady one. Wins over group."
+        required: false
+        default: ""
+
+permissions: {}
+
+jobs:
+  evidence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    env:
+      HEALTH_URL: https://nse-api-n959.onrender.com/health
+      SLOT: ${{ github.event.schedule }}
+      INPUT_GROUP: ${{ github.event.inputs.group }}
+      INPUT_TIMES: ${{ github.event.inputs.times }}
+    steps:
+      - name: Wait for each checkpoint, read the public health page, judge it
+        shell: python3 {0}
+        run: |
+          import http.client
+          import json
+          import os
+          import sys
+          import time
+          import urllib.error
+          import urllib.request
+          from datetime import datetime, time as dtime, timedelta, timezone
+          from zoneinfo import ZoneInfo
+
+          NY = ZoneInfo("America/New_York")
+          UTC = timezone.utc
+
+          URL = os.environ["HEALTH_URL"]
+          SLOT = os.environ.get("SLOT", "").strip()
+          IN_GROUP = os.environ.get("INPUT_GROUP", "").strip().upper()
+          IN_TIMES = os.environ.get("INPUT_TIMES", "").strip()
+          SUMMARY = os.environ.get("GITHUB_STEP_SUMMARY", "")
+          ATTEMPTS = int(os.environ.get("HEALTH_ATTEMPTS", "3"))
+          PAUSE_S = float(os.environ.get("HEALTH_PAUSE_S", "15"))
+          TIMEOUT_S = float(os.environ.get("HEALTH_TIMEOUT_S", "100"))
+          COLD_S = float(os.environ.get("HEALTH_COLD_S", "30"))
+
+          # Checkpoints (New York clock time) by the group of cron slots that serves them. Two slots per group: GitHub
+          # delays and drops scheduled runs, and a run that starts early simply waits for its checkpoint.
+          # C2 is 04:30, not 04:15: the interval jobs make their first poll one interval after the start (gdelt every 15 min),
+          # and once the 600 s startup grace is over a job that has not polled yet is reported stale. On 2026-10-02 readiness was
+          # DEGRADED ("stale jobs: gdelt") at 08:15:04Z and HEALTHY at 08:20:07Z, 08:25:12Z and 08:30:14Z.
+          GROUPS = {
+              "A": [("C1", "04:05:00"), ("C2", "04:30:00")],
+              "B": [("C3", "13:00:00")],
+              "C": [("C4", "19:50:00"), ("C5", "20:02:00")],
+          }
+          SLOTS = {
+              "30 6 * * 1-5": "A", "30 7 * * 1-5": "A",
+              "30 15 * * 1-5": "B", "30 16 * * 1-5": "B",
+              "30 20 * * 1-5": "C", "30 22 * * 1-5": "C",
+          }
+          PROFILE = {"C1": "early", "C5": "close"}  # every other checkpoint id is judged as a steady one
+          ON_TIME_S = 120        # a probe sent this soon after its checkpoint still counts as taken at it
+          LATE_MAX_S = 6 * 3600  # later than this the checkpoint counts as missed and nothing is requested
+          LATE_CLOSE_S = 480     # the service sleeps about 15 min after its last request, so a late read of the closing state
+                                 # (C5, two minutes after the close) is only sent within 8 min; later it would wake a sleeper
+          WINDOW_END = dtime(20, 0)  # regular end of the session window, New York time (16:00 close + 4 h); no late read after it
+          MAX_WAIT_S = 19200     # the job limit is 5 h 30 min; never wait longer than 5 h 20 min for a checkpoint
+          WOKE_SKEW_S = 10       # clock difference tolerated between the runner and the service
+          START_MAX_S = 120      # the worker's first start may trail the opening of the window by this much
+          STOP_MAX_S = 90        # and its stop may trail the closing of the window by this much
+          RANK = {"PASS": 0, "N/A": 0, "MISSING": 1, "DEGRADED": 2, "FAIL": 3}
+          ABSENT = object()      # a field the health page does not carry
+
+
+          def ts(moment):
+              return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+          def one_line(text):
+              """A value copied from the health page must not be able to start a new log line (or a workflow command)."""
+              return str(text).replace("\r", " ").replace("\n", " ")
+
+
+          def say(text):
+              print(f"{ts(datetime.now(UTC))} {one_line(text)}", flush=True)
+
+
+          def parse_ts(value):
+              if not isinstance(value, str) or not value:
+                  return None
+              try:
+                  moment = datetime.fromisoformat(value)
+              except ValueError:
+                  return None
+              return moment if moment.tzinfo else moment.replace(tzinfo=UTC)
+
+
+          def window_open(target):
+              return datetime.combine(target.astimezone(NY).date(), dtime(4, 0), tzinfo=NY)
+
+
+          def get(obj, *path):
+              for key in path:
+                  if not isinstance(obj, dict) or key not in obj:
+                      return ABSENT
+                  obj = obj[key]
+              return obj
+
+
+          def val(obj, *path):
+              found = get(obj, *path)
+              return None if found is ABSENT else found
+
+
+          def resolve_targets(now):
+              """(mode, group, [(checkpoint id, UTC moment)]); ValueError when the inputs name nothing."""
+              if IN_TIMES:
+                  targets = []
+                  for number, part in enumerate((p.strip() for p in IN_TIMES.split(",") if p.strip()), start=1):
+                      name, _, when = part.rpartition("=")
+                      moment = parse_ts(when.strip())
+                      if moment is None:
+                          raise ValueError(f"cannot read the time {when!r}")
+                      targets.append((name.strip() or f"T{number}", moment.astimezone(UTC)))
+                  return "rehearsal", "-", targets
+              group = IN_GROUP or SLOTS.get(SLOT, "")
+              if group not in GROUPS:
+                  raise ValueError(f"no checkpoint group for slot {SLOT!r} and group {IN_GROUP!r}")
+              day = now.astimezone(NY).date()
+              return "production", group, [
+                  (cid, datetime.combine(day, dtime.fromisoformat(clock), tzinfo=NY).astimezone(UTC))
+                  for cid, clock in GROUPS[group]
+              ]
+
+
+          def request_once():
+              sent = datetime.now(UTC)
+              began = time.monotonic()
+              http_status, raw, error = None, b"", ""
+              request = urllib.request.Request(
+                  URL, headers={"User-Agent": "news-signal-engine gh-evidence", "Accept": "application/json"}
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=TIMEOUT_S) as response:
+                      http_status, raw = response.status, response.read()
+              except urllib.error.HTTPError as exc:
+                  http_status = exc.code
+                  try:
+                      raw = exc.read()
+                  except (OSError, http.client.HTTPException):
+                      raw = b""
+              except (OSError, http.client.HTTPException) as exc:
+                  error = type(exc).__name__
+              seconds = time.monotonic() - began
+              body = None
+              if http_status == 200:
+                  try:
+                      parsed = json.loads(raw)
+                  except ValueError:
+                      parsed = None
+                  if isinstance(parsed, dict):
+                      body = parsed
+                  else:
+                      error = "not_the_health_document"
+              return {
+                  "sent": sent, "http": http_status, "seconds": seconds, "bytes": len(raw), "body": body, "error": error,
+                  "cls": "cold_start" if seconds >= COLD_S else "already_up",
+              }
+
+
+          def probe(cid):
+              """GET the health page, up to ATTEMPTS times; the last attempt is returned whatever it was."""
+              result = None
+              for attempt in range(1, ATTEMPTS + 1):
+                  result = request_once()
+                  say(
+                      f"RESULT id={cid} attempt={attempt}/{ATTEMPTS} sent={ts(result['sent'])} http={result['http']} "
+                      f"seconds={result['seconds']:.1f} bytes={result['bytes']} class={result['cls']} "
+                      f"error={result['error'] or '-'}"
+                  )
+                  if result["body"] is not None:
+                      break
+                  if attempt < ATTEMPTS:
+                      time.sleep(PAUSE_S)
+              return result
+
+
+          def project(h):
+              """The reduced view that is logged: no error texts, no job payloads, nothing the page does not need."""
+              def pick(path, keys):
+                  return {key: val(h, *path, key) for key in keys}
+
+              jobs = get(h, "jobs")
+              jobs = jobs if isinstance(jobs, list) else []
+              stale = get(h, "jobs_stale")
+              return {
+                  "commit": val(h, "release", "commit"),
+                  "session": val(h, "session"),
+                  "phase": val(h, "phase"),
+                  "db": val(h, "db"),
+                  "duty_cycle": pick(("duty_cycle",), (
+                      "enabled", "phase", "in_window", "opens_at", "closes_at", "windows_run", "last_started_at",
+                      "last_stopped_at")),
+                  "worker": pick(("worker",), ("ok", "age_seconds", "booted_at", "telegram_enabled")),
+                  "supervisor": {
+                      **pick(("supervisor",), (
+                          "embedded", "running", "starts", "restarts", "failures_in_window", "gave_up", "last_started_at",
+                      "last_crash_at")),
+                      "had_error": val(h, "supervisor", "last_error") is not None,
+                  },
+                  "readiness": pick(("readiness",), (
+                      "status", "reasons", "startup_grace", "session_open", "iex_expected", "duty_idle")),
+                  "catch_up": {
+                      **pick(("catch_up",), (
+                          "active", "backfilling", "gap_started_at", "cutoff", "backfill_fetched", "backfill_events",
+                          "finished_at")),
+                      "had_error": val(h, "catch_up", "backfill_error") is not None,
+                  },
+                  "jobs": {
+                      "listed": len(jobs),
+                      "stale": stale if isinstance(stale, list) else None,
+                      "last_run_failed": [j.get("job") for j in jobs if isinstance(j, dict) and j.get("ran_ok") is False],
+                  },
+                  "dead_letter": pick(("dead_letter",), ("telegram_send_failures", "last_error_at")),
+                  "telegram_priority": pick(("telegram_priority",), (
+                      "queue_depth", "total_dispatched", "total_suppressed_stale", "total_suppressed_ordering",
+                      "duplicate_send_count")),
+                  "memory": pick(("memory",), ("rss_mb", "pct", "state")),
+                  "fast_lane": {
+                      "status": val(h, "fast_lane", "status"),
+                      "iex_connected": val(h, "fast_lane", "iex_stream", "connected"),
+                      "iex_data_age_s": val(h, "fast_lane", "iex_stream", "data_age_seconds"),
+                  },
+              }
+
+
+          def judge(cid, target, pr, ctx):
+              """Turn one probe into checks and a verdict. ctx carries what an earlier checkpoint of the same run saw."""
+              kind = PROFILE.get(cid, "steady")
+              late_s = (pr["sent"] - target).total_seconds()
+              on_time = late_s <= ON_TIME_S
+              h = pr["body"]
+              opened = window_open(target)
+              checks = []
+              not_applicable = False
+
+              def add(name, result, detail=""):
+                  checks.append({"name": name, "result": result, "detail": detail})
+
+              def at_checkpoint(name, outcome):
+                  # About the moment of the checkpoint itself: a probe that came late cannot vouch for it.
+                  result, detail = outcome
+                  if on_time or result == "N/A":
+                      add(name, result, detail)
+                  else:
+                      add(name, "MISSING", f"probe sent {late_s:.0f} s after the checkpoint, so its state was not observed "
+                                           f"(later reading: {result}: {detail})")
+
+              def finish():
+                  worst = max((RANK[c["result"]] for c in checks), default=1)
+                  if worst:  # a FAIL, DEGRADED or MISSING is never hidden, not even behind "no window at this time"
+                      verdict = next(name for name, rank in RANK.items() if rank == worst)
+                  elif not_applicable:
+                      verdict = "N/A"
+                  else:
+                      verdict = "PASS" if any(c["result"] == "PASS" for c in checks) else "N/A"
+                  return {"verdict": verdict, "checks": checks, "late_s": late_s, "on_time": on_time}
+
+              in_window = get(h, "duty_cycle", "in_window") if h is not None else ABSENT
+              enabled = get(h, "duty_cycle", "enabled") if h is not None else ABSENT
+              # supervisor.last_started_at is when the supervisor of the window loop last started: the start of the web process,
+              # long before any worker, unless the loop was restarted (supervisor.restarts then says so). A supervisor that
+              # started after this request was sent belongs to the process that this request woke.
+              born = parse_ts(val(h, "supervisor", "last_started_at")) if h is not None else None
+              woke = born is not None and born >= pr["sent"] - timedelta(seconds=WOKE_SKEW_S)
+              born_text = f"supervisor started {ts(born)}" if born is not None else "supervisor start time not shown"
+
+              # Level 1, the server: the web process answers. Nothing here says the worker runs.
+              if pr["http"] is None:
+                  at_checkpoint("server_live", ("MISSING", f"no HTTP answer in {ATTEMPTS} attempts ({pr['error'] or 'unknown'})"))
+              elif pr["http"] != 200:
+                  at_checkpoint("server_live", ("FAIL", f"HTTP {pr['http']}"))
+              elif h is None:
+                  at_checkpoint("server_live", ("FAIL", "HTTP 200 but not the health document"))
+              elif pr["cls"] == "cold_start" and woke and in_window is False:
+                  at_checkpoint("server_live", ("N/A", f"answered after {pr['seconds']:.0f} s; {born_text}: this request woke a "
+                                                       "sleeping service, which is allowed while no session window is open"))
+              elif pr["cls"] == "cold_start":
+                  why = "this request woke the service" if woke else "it started before the request, so it was stalled, not asleep"
+                  at_checkpoint("server_live", ("FAIL", f"answered after {pr['seconds']:.0f} s (cold-start limit {COLD_S:.0f} s); "
+                                                        f"{born_text}: {why}"))
+              else:
+                  at_checkpoint("server_live", ("PASS", f"answered in {pr['seconds']:.1f} s; {born_text}"))
+              if h is None:
+                  return finish()
+
+              def supervisor_stable():
+                  restarts, failures, gave_up = (get(h, "supervisor", key) for key in ("restarts", "failures_in_window", "gave_up"))
+                  if ABSENT in (restarts, failures, gave_up):
+                      return "MISSING", "supervisor fields absent"
+                  if gave_up:
+                      return "FAIL", "the supervisor gave up restarting the worker"
+                  if restarts or failures:
+                      return "DEGRADED", (f"worker crashed and was restarted (restarts={restarts}, "
+                                          f"failures_in_window={failures}, last_crash_at={val(h, 'supervisor', 'last_crash_at')})")
+                  return "PASS", f"no restart (starts={val(h, 'supervisor', 'starts')})"
+
+              if kind == "close":
+                  # Level 2 again, the other end of the window: the worker stopped by itself at the close.
+                  if not isinstance(in_window, bool):
+                      at_checkpoint("window_closed", ("MISSING", "duty_cycle.in_window absent"))
+                  elif in_window:
+                      at_checkpoint("window_closed", ("FAIL", "the session window is still open at this time"))
+                  else:
+                      at_checkpoint("window_closed", ("PASS", f"closed, next opens_at={val(h, 'duty_cycle', 'opens_at')}"))
+                  phase = get(h, "duty_cycle", "phase")
+                  started = parse_ts(val(h, "duty_cycle", "last_started_at"))
+                  stopped = parse_ts(val(h, "duty_cycle", "last_stopped_at"))
+                  if phase is ABSENT:
+                      add("worker_stopped", "MISSING", "duty_cycle.phase absent")
+                  elif started is None or started < opened:
+                      if ctx.get("no_window") == "weekend":
+                          add("worker_stopped", "N/A", "no worker run today: a weekend has no session window")
+                      else:
+                          add("worker_stopped", "MISSING", "no worker start recorded today: cannot tell a day without a "
+                                                           "window from a worker that never started")
+                  elif phase != "idle":
+                      add("worker_stopped", "FAIL", f"duty_cycle.phase={phase!r} after the window closed")
+                  elif stopped is None or stopped < started:
+                      add("worker_stopped", "MISSING", "last_stopped_at absent or older than the start")
+                  elif ctx.get("closes_at") is None:
+                      add("worker_stopped", "PASS", f"stopped {ts(stopped)}; punctuality not judged, the close time was not seen")
+                  else:
+                      lag = (stopped - ctx["closes_at"]).total_seconds()
+                      if -5 <= lag <= STOP_MAX_S:
+                          add("worker_stopped", "PASS", f"stopped {lag:.1f} s after the scheduled close {ts(ctx['closes_at'])}")
+                      else:
+                          add("worker_stopped", "DEGRADED", f"stopped {lag:.1f} s from the scheduled close {ts(ctx['closes_at'])}")
+                  status = get(h, "readiness", "status")
+                  if status == "IDLE":
+                      at_checkpoint("readiness_status", ("PASS", "IDLE: the worker is stopped by design outside the window"))
+                  elif status is ABSENT:
+                      at_checkpoint("readiness_status", ("MISSING", "readiness.status absent"))
+                  else:
+                      at_checkpoint("readiness_status", ("DEGRADED", f"{status}, expected IDLE: {val(h, 'readiness', 'reasons')}"))
+                  add("supervisor_stable", *supervisor_stable())
+                  return finish()
+
+              # The window must be open at the checkpoint. A weekend has none (N/A); on a weekday that is MISSING, not N/A.
+              if enabled is False:
+                  add("window_open", "FAIL", "duty cycle disabled: the worker is not bound to the session window, which the "
+                                             "free-tier hours budget assumes")
+              elif not isinstance(in_window, bool):
+                  at_checkpoint("window_open", ("MISSING", "duty_cycle.in_window absent"))
+                  return finish()
+              elif not in_window:
+                  if on_time and target.astimezone(NY).weekday() >= 5:
+                      add("window_open", "N/A", "a weekend has no session window (next opens_at="
+                                                f"{val(h, 'duty_cycle', 'opens_at')}); the other checks do not apply")
+                      ctx["no_window"] = "weekend"
+                      not_applicable = True
+                  elif on_time:
+                      # The service decides this from its own exchange calendar, which is what is being checked, and this
+                      # workflow has no calendar of its own: a holiday would explain it, a calendar fault would look the same.
+                      add("window_open", "MISSING", "the service reports no session window on a weekday (next opens_at="
+                                                    f"{val(h, 'duty_cycle', 'opens_at')}). A market holiday would explain that, but "
+                                                    "nothing here can confirm it, so the day is not verified")
+                      ctx["no_window"] = "weekday"
+                  else:
+                      add("window_open", "MISSING", f"probe sent {late_s:.0f} s after the checkpoint and the window had "
+                                                    "closed by then, so the checkpoint was not observed")
+                  return finish()
+              else:
+                  add("window_open", "PASS", f"session window open until {val(h, 'duty_cycle', 'closes_at')}")
+                  ctx["closes_at"] = parse_ts(val(h, "duty_cycle", "closes_at"))
+
+              # Level 2, the worker started: the window loop entered the window and began the worker. Set before the
+              # worker has finished booting, so it says nothing about readiness.
+              phase = get(h, "duty_cycle", "phase")
+              started = parse_ts(val(h, "duty_cycle", "last_started_at"))
+              runs = get(h, "duty_cycle", "windows_run")
+              restarts = get(h, "supervisor", "restarts")
+              if enabled is False:
+                  add("worker_started", "N/A", "duty cycle disabled")
+              elif phase is ABSENT or runs is ABSENT or restarts is ABSENT:
+                  add("worker_started", "MISSING", "duty_cycle or supervisor fields absent")
+              elif phase != "running":
+                  add("worker_started", "FAIL", f"duty_cycle.phase={phase!r} inside the window: the worker was not started")
+              elif started is None:
+                  add("worker_started", "MISSING", "duty_cycle.last_started_at absent")
+              elif started < opened:
+                  add("worker_started", "FAIL", f"last start {ts(started)} is from before today's window ({ts(opened)})")
+              elif restarts or runs != 1:
+                  add("worker_started", "MISSING", f"first start not retained: the worker was restarted (restarts={restarts}, "
+                                                   f"windows_run={runs}); latest start {ts(started)}")
+              else:
+                  delay = (started - opened).total_seconds()
+                  if delay <= START_MAX_S:
+                      add("worker_started", "PASS", f"started {delay:.1f} s after the window opened ({ts(started)})")
+                  else:
+                      add("worker_started", "FAIL", f"started {delay:.0f} s after the window opened (limit {START_MAX_S} s)")
+
+              # Level 3, the worker is ready: it finished booting, keeps its heartbeat, and the service judges itself healthy.
+              ok = get(h, "worker", "ok")
+              booted = parse_ts(val(h, "worker", "booted_at"))
+              if ok is ABSENT:
+                  at_checkpoint("worker_heartbeat", ("MISSING", "worker.ok absent"))
+              elif ok is not True:
+                  at_checkpoint("worker_heartbeat", ("FAIL", f"heartbeat missing or stale (age={val(h, 'worker', 'age_seconds')} s, "
+                                                             f"reason={val(h, 'worker', 'reason')})"))
+              elif booted is None:
+                  at_checkpoint("worker_heartbeat", ("MISSING", "worker.booted_at absent"))
+              elif booted < opened:
+                  at_checkpoint("worker_heartbeat", ("FAIL", f"the heartbeat's boot time {ts(booted)} is from before today's window"))
+              else:
+                  at_checkpoint("worker_heartbeat", ("PASS", f"age {val(h, 'worker', 'age_seconds')} s, booted {ts(booted)}"))
+
+              status = get(h, "readiness", "status")
+              reasons = val(h, "readiness", "reasons")
+              why = "; ".join(str(r) for r in reasons) if isinstance(reasons, list) else ""
+              if status == "HEALTHY":
+                  at_checkpoint("readiness_status", ("PASS", "HEALTHY"))
+              elif status == "DEGRADED":
+                  at_checkpoint("readiness_status", ("DEGRADED", f"DEGRADED: {why}"))
+              elif status in ("NOT_READY", "IDLE"):
+                  at_checkpoint("readiness_status", ("FAIL", f"{status} inside the window: {why}"))
+              elif status is ABSENT:
+                  at_checkpoint("readiness_status", ("MISSING", "readiness.status absent"))
+              else:
+                  at_checkpoint("readiness_status", ("MISSING", f"unknown readiness status {status!r}"))
+
+              grace = get(h, "readiness", "startup_grace")
+              jobs = get(h, "jobs")
+              stale = get(h, "jobs_stale")
+              if kind == "early":
+                  add("startup_grace_over", "N/A", "judged from the next checkpoint: the first minutes are inside the 600 s grace")
+                  add("jobs_fresh", "N/A", "judged from the next checkpoint")
+              else:
+                  if grace is ABSENT:
+                      at_checkpoint("startup_grace_over", ("MISSING", "readiness.startup_grace absent"))
+                  elif grace:
+                      at_checkpoint("startup_grace_over", ("MISSING", "still inside the 600 s startup grace: stale jobs are "
+                                                                      "hidden during it, so steady readiness is not shown"))
+                  else:
+                      at_checkpoint("startup_grace_over", ("PASS", "grace over"))
+                  if not isinstance(jobs, list) or not isinstance(stale, list):
+                      at_checkpoint("jobs_fresh", ("MISSING", "jobs or jobs_stale absent"))
+                  elif grace is not False:
+                      at_checkpoint("jobs_fresh", ("MISSING", "job freshness is not judged while the startup grace is on"))
+                  elif not jobs:
+                      at_checkpoint("jobs_fresh", ("MISSING", "no job heartbeat listed"))
+                  elif stale:
+                      at_checkpoint("jobs_fresh", ("DEGRADED", "stale jobs: " + ", ".join(str(j) for j in stale)))
+                  else:
+                      failed = [str(j.get("job")) for j in jobs if isinstance(j, dict) and j.get("ran_ok") is False]
+                      if failed:
+                          at_checkpoint("jobs_fresh", ("DEGRADED", "last run failed: " + ", ".join(failed)))
+                      else:
+                          at_checkpoint("jobs_fresh", ("PASS", f"{len(jobs)} jobs fresh"))
+
+              catch = get(h, "catch_up")
+              if kind == "early":
+                  add("catch_up_done", "N/A", "judged from the next checkpoint: a backfill after a long sleep may still run")
+              elif not isinstance(catch, dict):
+                  add("catch_up_done", "MISSING", "catch_up absent")
+              elif not catch.get("gap_started_at"):
+                  add("catch_up_done", "N/A", "no wake-up gap recorded in this boot")
+              elif catch.get("backfill_error"):
+                  add("catch_up_done", "DEGRADED", "the backfill recorded an error")
+              elif catch.get("backfilling"):
+                  add("catch_up_done", "DEGRADED", "the backfill is still running")
+              elif not catch.get("finished_at"):
+                  add("catch_up_done", "MISSING", "catch_up.finished_at absent")
+              else:
+                  add("catch_up_done", "PASS", f"finished {catch.get('finished_at')} (fetched={catch.get('backfill_fetched')}, "
+                                               f"events={catch.get('backfill_events')})")
+
+              add("supervisor_stable", *supervisor_stable())
+
+              enabled_tg = get(h, "worker", "telegram_enabled")
+              failures = get(h, "dead_letter", "telegram_send_failures")
+              if enabled_tg is ABSENT or failures is ABSENT:
+                  at_checkpoint("telegram_delivery", ("MISSING", "worker.telegram_enabled or dead_letter absent"))
+              elif enabled_tg is not True:
+                  at_checkpoint("telegram_delivery", ("FAIL", "Telegram delivery is disabled"))
+              elif failures:
+                  at_checkpoint("telegram_delivery", ("DEGRADED", f"{failures} failed send attempts this process"))
+              else:
+                  at_checkpoint("telegram_delivery", ("PASS", "enabled, no failed send"))
+              return finish()
+
+
+          def skipped(cid, target, reason, result="MISSING"):
+              return {
+                  "id": cid, "target": target, "probe": None, "verdict": result, "late_s": None, "on_time": False,
+                  "checks": [{"name": "checkpoint", "result": result, "detail": reason}],
+              }
+
+
+          def latest_probe(cid, target):
+              """The last moment a read for this checkpoint may still be sent. Any request wakes a sleeping service, and
+              the service sleeps outside its window, so a late read is only worth sending while it is expected to be awake:
+              until the regular end of the window for the checkpoints inside it, a few minutes after the close for C5."""
+              on_time = target + timedelta(seconds=ON_TIME_S)  # a read that is on time is never skipped, whatever the hour
+              if PROFILE.get(cid) == "close":
+                  return max(target + timedelta(seconds=LATE_CLOSE_S), on_time)
+              end = datetime.combine(target.astimezone(NY).date(), WINDOW_END, tzinfo=NY)
+              return max(min(target + timedelta(seconds=LATE_MAX_S), end), on_time)
+
+
+          def run_checkpoint(cid, target, ctx):
+              if ctx.get("no_window"):
+                  # An earlier checkpoint of this run saw that the service has no session window today; do not wake it again.
+                  result = "N/A" if ctx["no_window"] == "weekend" else "MISSING"
+                  return skipped(cid, target, "no session window today (seen at an earlier checkpoint of this run): nothing "
+                                              "requested, so that the read does not wake the service", result)
+              ahead = (target - datetime.now(UTC)).total_seconds()
+              if ahead > MAX_WAIT_S:
+                  return skipped(cid, target, f"{ahead / 3600:.1f} h ahead: longer than this job may wait")
+              if ahead > 0:
+                  say(f"WAIT id={cid} until={ts(target)} ({ahead:.0f} s)")
+              while True:
+                  remaining = (target - datetime.now(UTC)).total_seconds()
+                  if remaining <= 0:
+                      break
+                  time.sleep(min(remaining, 600))
+              now = datetime.now(UTC)
+              if now > latest_probe(cid, target):
+                  return skipped(cid, target, f"the run reached this checkpoint {(now - target).total_seconds() / 60:.0f} min "
+                                              "late, when the service is no longer expected to be awake: nothing requested, "
+                                              "because the request would wake it")
+              pr = probe(cid)
+              outcome = judge(cid, target, pr, ctx)
+              outcome.update(id=cid, target=target, probe=pr)
+              return outcome
+
+
+          def report(row):
+              cid, target, pr = row["id"], row["target"], row["probe"]
+              if pr is None:
+                  say(f"CHECKPOINT id={cid} target={ts(target)} probe=none verdict={row['verdict']}")
+              else:
+                  say(
+                      f"CHECKPOINT id={cid} target={ts(target)} sent={ts(pr['sent'])} late_s={row['late_s']:.0f} "
+                      f"on_time={str(row['on_time']).lower()} http={pr['http']} seconds={pr['seconds']:.1f} bytes={pr['bytes']} "
+                      f"class={pr['cls']} commit={val(pr['body'], 'release', 'commit')} verdict={row['verdict']}"
+                  )
+              for check in row["checks"]:
+                  say(f"CHECK id={cid} name={check['name']} result={check['result']} detail={check['detail']}")
+              evidence = {
+                  "id": cid, "target": ts(target), "verdict": row["verdict"], "late_s": row["late_s"], "on_time": row["on_time"],
+                  "probe": None if pr is None else {
+                      "sent": ts(pr["sent"]), "http": pr["http"], "seconds": round(pr["seconds"], 2), "bytes": pr["bytes"],
+                      "class": pr["cls"], "error": pr["error"] or None,
+                  },
+                  "checks": {c["name"]: [c["result"], c["detail"]] for c in row["checks"]},
+                  "snapshot": None if pr is None or pr["body"] is None else project(pr["body"]),
+              }
+              say("EVIDENCE " + json.dumps(evidence, separators=(",", ":"), default=str))
+              bad = [f"{c['name']}={c['result']}" for c in row["checks"] if c["result"] not in ("PASS", "N/A")]
+              if row["verdict"] not in ("PASS", "N/A"):
+                  text = f"{cid} {row['verdict']}: " + ", ".join(bad)
+                  print("::error title=activity-evidence::" + text.replace("%", "%25").replace("\r", "").replace("\n", " "), flush=True)
+
+
+          def write_summary(mode, group, rows):
+              if not SUMMARY:
+                  return
+              lines = [
+                  f"### activity-evidence, group {group} ({mode})", "",
+                  "| checkpoint | target (UTC) | sent (UTC) | late s | HTTP | seconds | bytes | class | verdict |",
+                  "|---|---|---|---|---|---|---|---|---|",
+              ]
+              for row in rows:
+                  pr = row["probe"]
+                  if pr is None:
+                      lines.append(f"| {row['id']} | {ts(row['target'])} | - | - | - | - | - | - | **{row['verdict']}** |")
+                  else:
+                      lines.append(
+                          f"| {row['id']} | {ts(row['target'])} | {ts(pr['sent'])} | {row['late_s']:.0f} | {pr['http']} | "
+                          f"{pr['seconds']:.1f} | {pr['bytes']} | {pr['cls']} | **{row['verdict']}** |"
+                      )
+              problems = [(row["id"], c) for row in rows for c in row["checks"] if c["result"] not in ("PASS", "N/A")]
+              if problems:
+                  lines += ["", "Checks that are not PASS:", ""]
+                  lines += [f"* {cid} `{c['name']}` **{c['result']}**: {one_line(c['detail'])}" for cid, c in problems]
+              lines += ["", "A green run means every checkpoint is PASS or N/A. MISSING is never a pass.", ""]
+              with open(SUMMARY, "a", encoding="utf-8") as handle:
+                  handle.write("\n".join(lines) + "\n")
+
+
+          def main():
+              now = datetime.now(UTC)
+              try:
+                  mode, group, targets = resolve_targets(now)
+              except ValueError as exc:
+                  print(f"::error title=activity-evidence::{exc}", flush=True)
+                  return 2
+              say(f"START mode={mode} group={group} slot={SLOT or '-'} url={URL} "
+                  "targets=" + ",".join(f"{cid}@{ts(moment)}" for cid, moment in targets))
+              ctx = {}
+              rows = []
+              for cid, target in targets:
+                  row = run_checkpoint(cid, target, ctx)
+                  report(row)
+                  rows.append(row)
+              write_summary(mode, group, rows)
+              verdicts = " ".join(f"{row['id']}={row['verdict']}" for row in rows)
+              say(f"DONE {verdicts}")
+              return 0 if all(row["verdict"] in ("PASS", "N/A") for row in rows) else 1
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
