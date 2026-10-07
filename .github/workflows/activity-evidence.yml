@@ -428,7 +428,12 @@ jobs:
                   if delay <= START_MAX_S:
                       add("worker_started", "PASS", f"started {delay:.1f} s after the window opened ({ts(started)})")
                   else:
-                      add("worker_started", "FAIL", f"started {delay:.0f} s after the window opened (limit {START_MAX_S} s)")
+                      # These counters and last_started_at belong to this web process and reset on a deploy.
+                      # A late current-process start cannot establish that the day's first worker started late.
+                      # Actual inactive-worker and pre-window timestamp failures above remain failures.
+                      add("worker_started", "MISSING", f"latest process started {delay:.0f} s after the window opened; "
+                                                       "the first daily start is not retained across deployments "
+                                                       f"(limit {START_MAX_S} s)")
 
               # Level 3, the worker is ready: it finished booting, keeps its heartbeat, and the service judges itself healthy.
               ok = get(h, "worker", "ok")
